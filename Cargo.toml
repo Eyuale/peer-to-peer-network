@@ -1,0 +1,13 @@
+[package]
+name = "peep-to-peer-network"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.3", features = ["full"] }
+wincode = { version = "0.6.3", features = ["derive"] }
+redb = "4.4.0"
+sha2 = "0.11.1"
+hex = "0.4.3"
+ed25519-dalek = "3.0.0"
