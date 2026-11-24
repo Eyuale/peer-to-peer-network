@@ -2,7 +2,7 @@ mod db;
 mod difficulity;
 mod mining;
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hex;
@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use wincode::{SchemaRead, SchemaWrite};
 
@@ -97,12 +97,19 @@ const TRANSACTIONS: TableDefinition<TxId, &[u8]> = TableDefinition::new("transac
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:8001").await?;
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8001);
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     let (tx, _) = broadcast::channel(128);
 
     let mut peers: Vec<SocketAddr> = Vec::new();
 
-    let db = std::sync::Arc::new(crate::db::initialize_db("mempool.redb")?);
+    let connect =
+        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect("127.0.0.1:8000"));
+
+    let db = std::sync::Arc::new(crate::db::initialize_db(&format!("mempool-{port}.redb"))?);
 
     let chain_tip = std::sync::Arc::new(AtomicU64::new(
         db::latest_block(&db)?
@@ -129,171 +136,184 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let db = db.clone();
         let chain_tip = chain_tip.clone();
-        let mut rx = tx.subscribe();
-        let (mut reader, mut writer) = socket.into_split();
+        spawn_peer(tx.clone(), socket, db, chain_tip, peer_addr);
+    }
+}
 
-        let writer_task = tokio::spawn(async move {
-            while let Ok(bytes) = rx.recv().await {
-                if writer.write_all(&bytes).await.is_err() {
-                    break;
-                }
+fn spawn_peer(
+    tx: tokio::sync::broadcast::Sender<std::sync::Arc<[u8]>>,
+    socket: tokio::net::TcpStream,
+    db: std::sync::Arc<redb::Database>,
+    chain_tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    peer_addr: std::net::SocketAddr,
+) {
+    let mut rx = tx.subscribe();
+    let gossip_tx = tx.clone();
+    let (mut reader, mut writer) = socket.into_split();
+
+    let writer_task = tokio::spawn(async move {
+        while let Ok(bytes) = rx.recv().await {
+            if writer.write_all(&bytes).await.is_err() {
+                break;
             }
-        });
+        }
+    });
 
-        tokio::spawn(async move {
-            let mut header = [0u8; 4];
+    tokio::spawn(async move {
+        let mut header = [0u8; 4];
 
-            loop {
-                if let Err(e) = reader.read_exact(&mut header).await {
-                    println!("🔌 Peer {} disconnected: {}", peer_addr, e);
+        loop {
+            if let Err(e) = reader.read_exact(&mut header).await {
+                println!("🔌 Peer {} disconnected: {}", peer_addr, e);
+                break;
+            }
+
+            let len = u32::from_be_bytes(header) as usize;
+            if len == 0 || len > 8 * 1024 * 1024 {
+                eprintln!("❌ Peer {} sent invalid frame length {}", peer_addr, len);
+                break;
+            }
+
+            let mut buf = vec![0u8; len];
+            if let Err(e) = reader.read_exact(&mut buf).await {
+                eprintln!("❌ Peer {} sent truncated frame: {}", peer_addr, e);
+                break;
+            }
+
+            let msg: Message = match wincode::deserialize(&buf) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("❌ Peer {} sent malformed message: {}", peer_addr, e);
                     break;
                 }
+            };
 
-                let len = u32::from_be_bytes(header) as usize;
-                if len == 0 || len > 8 * 1024 * 1024 {
-                    eprintln!("❌ Peer {} sent invalid frame length {}", peer_addr, len);
-                    break;
-                }
+            match msg {
+                Message::NewBlock(msg) => {
+                    let block_height = msg.block_header.block_height;
 
-                let mut buf = vec![0u8; len];
-                if let Err(e) = reader.read_exact(&mut buf).await {
-                    eprintln!("❌ Peer {} sent truncated frame: {}", peer_addr, e);
-                    break;
-                }
-
-                let msg: Message = match wincode::deserialize(&buf) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("❌ Peer {} sent malformed message: {}", peer_addr, e);
-                        break;
-                    }
-                };
-
-                match msg {
-                    Message::NewBlock(msg) => {
-                        let block_height = msg.block_header.block_height;
-
-                        match mining::verify_and_store_block(&db, msg) {
-                            Ok(true) => {
-                                chain_tip.store(block_height, Ordering::SeqCst);
-                                println!(
-                                    "✅ Stored block {} from peer {}",
-                                    block_height, peer_addr
-                                );
-                            }
-                            Ok(false) => {
-                                println!("❌ Peer {} sent an invalid or stale block", peer_addr);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "❌ Failed to store block from peer {}: {}",
-                                    peer_addr, e
-                                );
-                            }
+                    match mining::verify_and_store_block(&db, msg) {
+                        Ok(true) => {
+                            chain_tip.store(block_height, Ordering::SeqCst);
+                            println!("✅ Stored block {} from peer {}", block_height, peer_addr);
+                            let mut framed = Vec::with_capacity(4 + buf.len());
+                            framed.extend_from_slice(&header);
+                            framed.extend_from_slice(&buf);
+                            let _ = gossip_tx.send(std::sync::Arc::from(framed));
+                        }
+                        Ok(false) => {
+                            println!("❌ Peer {} sent an invalid or stale block", peer_addr);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to store block from peer {}: {}", peer_addr, e);
                         }
                     }
-                    Message::Handshake { version: _ } => {}
-                    Message::NewTransaction(msg) => {
-                        if msg.amount == 0 {
-                            println!("Amount must be greater than zero");
-                            continue;
-                        }
+                }
+                Message::Handshake { version: _ } => {}
+                Message::NewTransaction(msg) => {
+                    if msg.amount == 0 {
+                        println!("Amount must be greater than zero");
+                        continue;
+                    }
 
-                        if msg.sender == msg.receiver {
-                            println!("sender and receiver are the same");
-                            continue;
-                        }
+                    if msg.sender == msg.receiver {
+                        println!("sender and receiver are the same");
+                        continue;
+                    }
 
-                        if msg.fee <= 2 {
-                            println!("fee must be above 2");
-                            continue;
-                        }
+                    if msg.fee <= 2 {
+                        println!("fee must be above 2");
+                        continue;
+                    }
 
-                        if !msg.verify_signature() {
-                            println!("tampered data or signature not right");
-                            continue;
-                        }
+                    if !msg.verify_signature() {
+                        println!("tampered data or signature not right");
+                        continue;
+                    }
 
-                        let txid: TxId = msg.compute_txid();
+                    let txid: TxId = msg.compute_txid();
 
-                        let already_exists = {
-                            let read_tx = match db.begin_read() {
-                                Ok(tx) => tx,
-                                Err(e) => {
-                                    eprintln!("❌ Failed to begin read: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            let table = match read_tx.open_table(TRANSACTIONS) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    eprintln!("open_table: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            match table.get(txid) {
-                                Ok(v) => v.is_some(),
-                                Err(e) => {
-                                    eprintln!("get: {}", e);
-                                    continue;
-                                }
-                            }
-                        };
-
-                        if already_exists {
-                            println!("transaction found in mempool, no need to add it again");
-                            continue;
-                        }
-
-                        let bytes = match wincode::serialize(&msg) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("serialize: {}", e);
-                                continue;
-                            }
-                        };
-
-                        let write_tx = match db.begin_write() {
+                    let already_exists = {
+                        let read_tx = match db.begin_read() {
                             Ok(tx) => tx,
                             Err(e) => {
-                                eprintln!("begin_write: {}", e);
+                                eprintln!("❌ Failed to begin read: {}", e);
                                 continue;
                             }
                         };
 
-                        {
-                            let mut table = match write_tx.open_table(TRANSACTIONS) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    eprintln!("open_table: {}", e);
-                                    continue;
-                                }
-                            };
+                        let table = match read_tx.open_table(TRANSACTIONS) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("open_table: {}", e);
+                                continue;
+                            }
+                        };
 
-                            if let Err(e) = table.insert(txid, bytes.as_slice()) {
-                                eprintln!("insert: {}", e);
+                        match table.get(txid) {
+                            Ok(v) => v.is_some(),
+                            Err(e) => {
+                                eprintln!("get: {}", e);
                                 continue;
                             }
                         }
+                    };
 
-                        if let Err(e) = write_tx.commit() {
-                            eprintln!("commit: {}", e);
-                            continue;
-                        }
-
-                        println!("💾 Saved transaction {:?}", txid);
+                    if already_exists {
+                        println!("transaction found in mempool, no need to add it again");
+                        continue;
                     }
 
-                    Message::GetBlock { block_height: _ } => {}
+                    let bytes = match wincode::serialize(&msg) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("serialize: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let write_tx = match db.begin_write() {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            eprintln!("begin_write: {}", e);
+                            continue;
+                        }
+                    };
+
+                    {
+                        let mut table = match write_tx.open_table(TRANSACTIONS) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("open_table: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = table.insert(txid, bytes.as_slice()) {
+                            eprintln!("insert: {}", e);
+                            continue;
+                        }
+                    }
+
+                    if let Err(e) = write_tx.commit() {
+                        eprintln!("commit: {}", e);
+                        continue;
+                    }
+
+                    println!("💾 Saved transaction {:?}", txid);
+                    let mut framed = Vec::with_capacity(4 + buf.len());
+                    framed.extend_from_slice(&header);
+                    framed.extend_from_slice(&buf);
+                    let _ = gossip_tx.send(std::sync::Arc::from(framed));
                 }
 
-                println!("📦 Received {} bytes from {}", buf.len(), peer_addr);
+                Message::GetBlock { block_height: _ } => {}
             }
-            writer_task.abort();
-        });
-    }
+
+            println!("📦 Received {} bytes from {}", buf.len(), peer_addr);
+        }
+        writer_task.abort();
+    });
 }
 
 #[cfg(test)]
