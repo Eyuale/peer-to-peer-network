@@ -106,8 +106,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut peers: Vec<SocketAddr> = Vec::new();
 
-    let connect =
-        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect("127.0.0.1:8000"));
+    let seed: String = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "127.0.0.1:8000".to_string());
+    let seed_addr: SocketAddr = seed.parse()?;
+    let self_addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+
+    let outbound_socket = if seed_addr == self_addr {
+        println!("Skipping self-connect to {}", seed_addr);
+        None
+    } else {
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(seed_addr)).await {
+            Ok(Ok(socket)) => Some(socket),
+            Ok(Err(e)) => {
+                eprintln!("Could not connect to seed {}: {}", seed_addr, e);
+                None
+            }
+            Err(_) => {
+                eprintln!("Timed out connecting to seed {}", seed_addr);
+                None
+            }
+        }
+    };
 
     let db = std::sync::Arc::new(crate::db::initialize_db(&format!("mempool-{port}.redb"))?);
 
@@ -117,6 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(u64::MAX),
     ));
 
+    if let Some(outbound_socket) = outbound_socket {
+        spawn_peer(
+            tx.clone(),
+            outbound_socket,
+            db.clone(),
+            chain_tip.clone(),
+            seed_addr,
+        );
+    }
     {
         let wtx = db.begin_write()?;
         wtx.open_table(TRANSACTIONS)?;
